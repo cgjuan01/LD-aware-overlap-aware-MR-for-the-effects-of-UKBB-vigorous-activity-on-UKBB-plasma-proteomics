@@ -6,7 +6,7 @@ Fine-mapped vigorous-activity SNPs (exposure)
 
 UK Biobank Pharma Proteomics Project v1 & v2 protein GWAS (outcomes)
 
-Generation Scotland LD reference panel (87×87 LD matrix)
+UK Biobank LD reference panel (87×87 LD matrix)
 
 Overlap-aware IVW estimator, adjusting for exposure–outcome sample overlap via rho
 
