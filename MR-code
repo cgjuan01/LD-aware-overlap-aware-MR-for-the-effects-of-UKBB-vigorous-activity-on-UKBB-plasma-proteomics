@@ -1,0 +1,211 @@
+#!/usr/bin/env Rscript
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(Matrix)
+})
+
+EXPOSURE_FILE <- "/Users/ciara/Downloads/fine-mapped-pa-snps_fixed.csv"
+LD_FILE       <- "/Users/ciara/Downloads/GS_LD_square.csv"
+
+PPP_FILE <- '/Volumes/4TB Drive/UKB_PPP_sumstats_extracted/AARSD1_Q9BTE6_OID21311_v1_Oncology/AARSD1_Q9BTE6_OID21311_v1_Oncology/AARSD1_Q9BTE6_OID21311_v1_Oncology_done.tsv.gz'
+
+OUTDIR   <- "/Users/ciara/Downloads/LDaware_MR_proteins/mr_outputs_PPP_LDaware_overlap_test"
+dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
+
+rho        <- 0.06
+n_exp      <- 91184
+debug_harm <- TRUE
+
+# =============== LOAD LD MATRIX ==========================
+load_ld <- function(ld_file) {
+  ld_dt <- fread(ld_file)
+  snps  <- toupper(ld_dt[[1L]])   # first column "SNP"
+  mat   <- as.matrix(ld_dt[, -1L, with = FALSE])
+  R     <- as(mat, "dsyMatrix")
+  list(R = R, snps = data.table(rsid = snps))
+}
+
+# =============== LD-AWARE IVW ============================
+ld_ivw <- function(bx, by, se_y, R, rho = 0, n_exp = n_exp, n_out = NULL) {
+  k <- length(bx)
+  if (k < 2) return(NULL)
+
+  if (is.null(n_out) || is.na(n_out) || n_out <= 0) {
+    n_out <- 54000
+  }
+
+  sigma2    <- (1 / (2 * n_out)) + (rho^2 / (2 * n_exp))
+  Sigma     <- R * sigma2
+  Sigma_inv <- solve(Sigma)
+
+  XtSiX    <- as.numeric(t(bx) %*% Sigma_inv %*% bx)
+  XtSiy    <- as.numeric(t(bx) %*% Sigma_inv %*% by)
+  beta_hat <- XtSiy / XtSiX
+  se_hat   <- sqrt(1 / XtSiX)
+  z        <- beta_hat / se_hat
+  p        <- 2 * pnorm(-abs(z))
+
+  list(beta = beta_hat, se = se_hat, pval = p)
+}
+
+# =============== HARMONISE ONE PPP FILE ==================
+harmonise_pgp <- function(pgp_file, exposure, ld_snps, debug = FALSE) {
+
+  cmd <- sprintf('gunzip -c "%s"', pgp_file)
+  dt  <- tryCatch(
+    fread(cmd = cmd, nThread = 2L),
+    error = function(e) NULL
+  )
+  if (is.null(dt) || nrow(dt) == 0L) {
+    if (debug) cat("   [harm] fread returned 0 rows\n")
+    return(NULL)
+  }
+
+  setnames(dt, tolower(names(dt)))
+  needed <- c("chrom","genpos","id","allele0","allele1","beta","se","n")
+  if (!all(needed %in% names(dt))) {
+    if (debug) cat("   [harm] missing needed columns in PPP file\n")
+    return(NULL)
+  }
+
+  dt[, rsid := toupper(id)]
+  exp <- copy(exposure)
+
+  # 1) overlap exp–PPP
+  m1 <- merge(exp, dt,
+              by.x = "SNP",
+              by.y = "rsid",
+              all = FALSE,
+              sort = FALSE)
+  if (debug) cat("   [harm] overlap exp–PPP:", nrow(m1), "SNPs\n")
+  if (nrow(m1) < 2L) return(NULL)
+
+  # 2) allele alignment
+  m1[, effect_allele.outcome := toupper(allele1)]
+  m1[, other_allele.outcome  := toupper(allele0)]
+
+  idx_flip <- m1$effect_allele.exposure == m1$other_allele.outcome &
+              m1$other_allele.exposure  == m1$effect_allele.outcome
+
+  idx_keep <- m1$effect_allele.exposure == m1$effect_allele.outcome &
+              m1$other_allele.exposure  == m1$other_allele.outcome
+
+  keep <- idx_flip | idx_keep
+  m2   <- m1[keep]
+
+  if (debug) cat("   [harm] after allele alignment:", nrow(m2), "SNPs\n")
+  if (nrow(m2) < 2L) return(NULL)
+
+  m2[idx_flip, beta := -beta]
+
+  # 3) intersect with LD SNPs
+  m3 <- merge(m2,
+              ld_snps,
+              by.x = "SNP",
+              by.y = "rsid",
+              all = FALSE,
+              sort = FALSE)
+
+  if (debug) cat("   [harm] after LD intersection:", nrow(m3), "SNPs\n")
+  if (nrow(m3) < 2L) return(NULL)
+
+  m3
+}
+
+# ============================= MAIN ==============================
+main <- function() {
+
+  ex <- fread(EXPOSURE_FILE)
+  setnames(ex,
+           c("SNP","beta.exposure","se.exposure",
+             "effect_allele.exposure","other_allele.exposure",
+             "eaf.exposure","p_value"),
+           c("SNP","beta.exposure","se.exposure",
+             "effect_allele.exposure","other_allele.exposure",
+             "eaf.exposure","p.exposure"))
+
+  ex[, SNP := toupper(SNP)]
+
+  ld <- load_ld(LD_FILE)
+  R       <- ld$R
+  ld_snps <- ld$snps
+
+  cat(sprintf("🧬 LD size: %dx%d | diag range: [%.3f, %.3f]\n",
+              nrow(R), ncol(R),
+              min(diag(R)), max(diag(R))))
+
+  ex_ld <- merge(ex, ld_snps,
+                 by.x = "SNP",
+                 by.y = "rsid",
+                 all = FALSE,
+                 sort = FALSE)
+
+  cat(sprintf("📦 Exposure SNPs used (in LD): %d\n", nrow(ex_ld)))
+  if (nrow(ex_ld) == 0L) {
+    cat("❌ No overlap between exposure SNPs and LD SNPs. Stopping.\n")
+    quit(status = 1)
+  }
+
+  cat("🧪 Testing single PPP file:\n   ", PPP_FILE, "\n", sep = "")
+
+  base         <- sub("_done.tsv.gz$", "", basename(PPP_FILE))
+  outcome_name <- base
+  cat(sprintf("=== %s (GRCh37) ===\n", outcome_name))
+
+  m <- harmonise_pgp(PPP_FILE, ex_ld, ld_snps, debug = debug_harm)
+  if (is.null(m) || nrow(m) < 2L) {
+    n_snp <- if (is.null(m)) 0L else nrow(m)
+    cat(sprintf(" → too few overlapping SNPs after harmonisation (%s)\n", n_snp))
+    cat("No MR fit for this protein.\n")
+    quit(status = 0)
+  }
+
+  # reorder to LD order & drop missing
+  m <- m[match(ld_snps$rsid, m$SNP), ][!is.na(beta)]
+  if (debug_harm) cat("   [harm] after LD ordering:", nrow(m), "SNPs\n")
+
+  if (nrow(m) < 2L) {
+    cat(" → <2 SNPs after LD ordering; skipping.\n")
+    quit(status = 0)
+  }
+
+  k     <- nrow(m)
+  R_sub <- as(R[1:k, 1:k], "dsyMatrix")
+
+  bx    <- m$beta.exposure
+  by    <- m$beta
+  se_y  <- m$se
+  n_out <- suppressWarnings(as.numeric(m$n[1]))
+
+  fit <- ld_ivw(bx, by, se_y, R_sub,
+                rho   = rho,
+                n_exp = n_exp,
+                n_out = n_out)
+
+  if (is.null(fit)) {
+    cat(" → MR failed; skipping.\n")
+    quit(status = 0)
+  }
+
+  cat(sprintf(" → OK (%d SNPs): beta = %.4f, se = %.4f, p = %.3e\n",
+              length(bx), fit$beta, fit$se, fit$pval))
+
+  out <- data.table(
+    outcome = outcome_name,
+    build   = "GRCh37",
+    nsnp    = length(bx),
+    beta    = fit$beta,
+    se      = fit$se,
+    pval    = fit$pval
+  )
+
+  outfile <- file.path(OUTDIR,
+                       sprintf("%s_MR_LDaware_overlap.tsv",
+                               outcome_name))
+  fwrite(out, file = outfile)
+  cat("✅ Saved AARSD1 MR result to:\n   ", outfile, "\n", sep = "")
+}
+
+main()
+
